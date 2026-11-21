@@ -24,6 +24,20 @@ local BUTTON_KEY = "Tab"        -- Tecla principal (ej. "Tab", "s", "Enter")
 local BUTTON_KEY_ALT = "s"      -- Tecla alternativa
 local SHOW_KEY_IN_BUTTON = false -- Mostrar [TAB] en la etiqueta del botón
 
+-- Estilo visual del botón (colores en formato ASS &HBBGGRR&)
+-- Normal : relleno blanco sólido, sin borde
+-- Hover  : borde blanco + relleno gris claro
+-- Pulsado: borde blanco + relleno gris medio
+local BUTTON_OPACITY       = 1.0         -- Opacidad general del botón (0..1)
+local BUTTON_RADIUS        = 6           -- Radio de las esquinas (a escala 1.0)
+local BUTTON_BORDER        = 3           -- Grosor del borde blanco en hover/pulsado (a escala 1.0)
+local COLOR_NORMAL_FILL    = "&HFFFFFF&" -- Blanco
+local COLOR_HOVER_FILL     = "&HE8E8E8&" -- Gris claro
+local COLOR_PRESSED_FILL   = "&H8E8E8E&" -- Gris medio
+local COLOR_BORDER         = "&HFFFFFF&" -- Borde blanco
+local COLOR_TEXT           = "&H000000&" -- Texto negro
+local PRESS_FEEDBACK_TIME  = 0.12        -- Segundos que se muestra el estado pulsado si no hay evento "up"
+
 -- Condición estricta: Requiere que se cumplan AMBAS condiciones obligatoriamente:
 -- 1. Que el nombre del capítulo coincida con Opening / Ending / Preview
 -- 2. Que la duración del capítulo esté entre 88 y 92 segundos (OP/ED)
@@ -75,6 +89,7 @@ local PV_THRESHOLD = {
 local overlay = mp.create_osd_overlay("ass-events")
 local button_visible = false
 local is_hovered = false
+local is_pressed = false        -- true mientras se mantiene pulsado (ratón o tecla)
 local current_chapter_index = nil
 local current_label = "Saltar Intro"
 local button_timer = nil
@@ -124,59 +139,79 @@ local function get_button_layout()
     local bx = screen_w - bw - margin_x
     local by = screen_h - bh - margin_y
 
-    return bx, by, bw, bh, font_size, display_text
+    return bx, by, bw, bh, font_size, display_text, scale
+end
+
+local function round(n)
+    return math.floor(n + 0.5)
+end
+
+-- Genera el trazado ASS de un rectángulo con esquinas redondeadas
+local function rounded_rect_path(x, y, w, h, r)
+    r = math.max(0, math.min(r, w / 2, h / 2))
+    local c = 0.5522847498 * r
+    local x0, x1, x2, x3 = x, x + r, x + w - r, x + w
+    local y0, y1, y2, y3 = y, y + r, y + h - r, y + h
+    local pts = {
+        "m", x1, y0,
+        "l", x2, y0,
+        "b", x2 + c, y0, x3, y1 - c, x3, y1,
+        "l", x3, y2,
+        "b", x3, y2 + c, x2 + c, y3, x2, y3,
+        "l", x1, y3,
+        "b", x1 - c, y3, x0, y2 + c, x0, y2,
+        "l", x0, y1,
+        "b", x0, y1 - c, x1 - c, y0, x1, y0,
+    }
+    for i, v in ipairs(pts) do
+        if type(v) == "number" then pts[i] = tostring(round(v)) end
+    end
+    return table.concat(pts, " ")
 end
 
 local function render_button()
     if not button_visible or not overlay then return end
 
-    local bx, by, bw, bh, font_size, display_text = get_button_layout()
+    local bx, by, bw, bh, font_size, display_text, scale = get_button_layout()
 
     overlay.res_x = screen_w
     overlay.res_y = screen_h
 
-    -- 80% de opacidad:
-    -- En formato ASS: 80% opaco = 20% transparente -> 255 * 0.20 = 51 = 0x33
-    -- En reposo: blanco (&HFFFFFF&) al 80% de opacidad
-    -- En hover: blanco ligeramente más oscuro / gris claro (&HD8D8D8&) al 80% de opacidad
-    local bg_color     = is_hovered and "&HD8D8D8&" or "&HFFFFFF&"
-    local bg_alpha     = opacity_to_ass_alpha(0.8 * fade_opacity)
-    local border_color = is_hovered and "&HB8B8B8&" or "&HE0E0E0&"
-    local border_alpha = opacity_to_ass_alpha(0.8 * fade_opacity)
-    local text_alpha   = opacity_to_ass_alpha(fade_opacity)
+    local radius = math.max(1, round(BUTTON_RADIUS * scale))
+    local border = math.max(1, round(BUTTON_BORDER * scale))
+    local alpha      = opacity_to_ass_alpha(BUTTON_OPACITY * fade_opacity)
+    local text_alpha = opacity_to_ass_alpha(fade_opacity)
 
     local ass = assdraw.ass_new()
 
-    -- Evento 1: Fondo del botón (rectángulo redondeado)
+    -- Evento 1: Fondo del botón
     ass:new_event()
     ass:an(7)
     ass:pos(0, 0)
-    ass:append(string.format("{\\p1\\c%s\\1a%s\\bord1\\3c%s\\3a%s}", bg_color, bg_alpha, border_color, border_alpha))
 
-    local r = 6
-    local c = 0.5522847498 * r
-    local x0, x1, x2, x3 = bx, bx + r, bx + bw - r, bx + bw
-    local y0, y1, y2, y3 = by, by + r, by + bh - r, by + bh
-    ass:append(string.format(
-        "m %d %d " ..
-        "l %d %d " ..
-        "b %d %d %d %d %d %d " ..
-        "l %d %d " ..
-        "b %d %d %d %d %d %d " ..
-        "l %d %d " ..
-        "b %d %d %d %d %d %d " ..
-        "l %d %d " ..
-        "b %d %d %d %d %d %d",
-        x1, y0,
-        x2, y0,
-        x2 + c, y0, x3, y1 - c, x3, y1,
-        x3, y2,
-        x3, y2 + c, x2 + c, y3, x2, y3,
-        x1, y3,
-        x1 - c, y3, x0, y2 + c, x0, y2,
-        x0, y1,
-        x0, y1 - c, x1 - c, y0, x1, y0
-    ))
+    if is_pressed or is_hovered then
+        -- Hover / Pulsado: relleno gris con borde blanco.
+        -- El relleno se encoge 'border' px por cada lado y el borde ASS (\bord) crece
+        -- hacia fuera, de modo que el tamaño exterior del botón es idéntico al normal
+        -- y la esquina exterior conserva el mismo radio.
+        local fill = is_pressed and COLOR_PRESSED_FILL or COLOR_HOVER_FILL
+        ass:append(string.format(
+            "{\\p1\\blur0\\shad0\\bord%d\\c%s\\1a%s\\3c%s\\3a%s}",
+            border, fill, alpha, COLOR_BORDER, alpha
+        ))
+        ass:append(rounded_rect_path(
+            bx + border, by + border,
+            bw - 2 * border, bh - 2 * border,
+            math.max(0, radius - border)
+        ))
+    else
+        -- Normal: relleno blanco sólido sin borde
+        ass:append(string.format(
+            "{\\p1\\blur0\\shad0\\bord0\\c%s\\1a%s}",
+            COLOR_NORMAL_FILL, alpha
+        ))
+        ass:append(rounded_rect_path(bx, by, bw, bh, radius))
+    end
     ass:append("{\\p0}")
 
     -- Evento 2: Texto centrado dentro del botón con tipografía Inter en negro
@@ -186,8 +221,8 @@ local function render_button()
     local cy = math.floor(by + bh / 2)
     ass:pos(cx, cy)
     ass:append(string.format(
-        "{\\fnInter\\fs%d\\b1\\c&H000000&\\1a%s\\bord0\\shad0}%s",
-        font_size, text_alpha, display_text
+        "{\\fnInter\\fs%d\\b1\\c%s\\1a%s\\bord0\\shad0}%s",
+        font_size, COLOR_TEXT, text_alpha, display_text
     ))
 
     overlay.data = ass.text
@@ -243,6 +278,7 @@ local function hide_skip_button()
     if not button_visible then return end
     button_visible = false
     is_hovered = false
+    is_pressed = false
     current_chapter_index = nil
 
     if button_timer then
@@ -303,10 +339,45 @@ local function trigger_skip()
     execute_seek(ch)
 end
 
+-- Crea un manejador de pulsación con estados down/up (binding "complex"):
+--  * down : muestra el estado pulsado (gris medio)
+--  * up   : ejecuta el salto (si es ratón, solo si se suelta encima del botón)
+--  * press: (sin down/up separados) muestra el estado pulsado un instante y salta
+local function make_press_handler(require_hover)
+    return function(e)
+        if not button_visible then return end
+        local ev = e and e.event or "press"
+
+        if ev == "down" then
+            is_pressed = true
+            render_button()
+        elseif ev == "up" then
+            if is_pressed and (not require_hover or is_hovered) then
+                trigger_skip()
+            else
+                is_pressed = false
+                render_button()
+            end
+        elseif ev == "press" then
+            is_pressed = true
+            render_button()
+            mp.add_timeout(PRESS_FEEDBACK_TIME, function()
+                if button_visible and is_pressed then
+                    trigger_skip()
+                end
+            end)
+        end
+    end
+end
+
+local mouse_press_handler = make_press_handler(true)
+local key_press_handler = make_press_handler(false)
+
 local function on_mouse_move(_, mouse)
     if not button_visible or not mouse or not mouse.hover then
         if is_hovered then
             is_hovered = false
+            is_pressed = false
             mp.remove_key_binding("op-ed-skip-click")
             render_button()
         end
@@ -319,10 +390,10 @@ local function on_mouse_move(_, mouse)
     if inside ~= is_hovered then
         is_hovered = inside
         if is_hovered then
-            mp.add_forced_key_binding("MBTN_LEFT", "op-ed-skip-click", function()
-                trigger_skip()
-            end)
+            mp.add_forced_key_binding("MBTN_LEFT", "op-ed-skip-click", mouse_press_handler, { complex = true })
         else
+            -- Si se sale del botón con el ratón pulsado, se cancela la pulsación
+            is_pressed = false
             mp.remove_key_binding("op-ed-skip-click")
         end
         render_button()
@@ -338,6 +409,7 @@ local function show_skip_button(chapter_idx, label)
     current_label = label or "Saltar Intro"
     button_visible = true
     is_hovered = false
+    is_pressed = false
     stop_fade()
 
     local ow, oh = mp.get_osd_size()
@@ -350,10 +422,10 @@ local function show_skip_button(chapter_idx, label)
 
     -- Asignar atajos de teclado mientras el botón está visible
     if BUTTON_KEY and BUTTON_KEY ~= "" then
-        mp.add_forced_key_binding(BUTTON_KEY, "op-ed-skip-key", trigger_skip)
+        mp.add_forced_key_binding(BUTTON_KEY, "op-ed-skip-key", key_press_handler, { complex = true })
     end
     if BUTTON_KEY_ALT and BUTTON_KEY_ALT ~= "" and BUTTON_KEY_ALT ~= BUTTON_KEY then
-        mp.add_forced_key_binding(BUTTON_KEY_ALT, "op-ed-skip-key-alt", trigger_skip)
+        mp.add_forced_key_binding(BUTTON_KEY_ALT, "op-ed-skip-key-alt", key_press_handler, { complex = true })
     end
 
     -- Temporizador para ocultar el botón si el usuario decide no saltar
