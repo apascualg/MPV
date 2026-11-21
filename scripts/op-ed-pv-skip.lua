@@ -1,57 +1,557 @@
--- configuration
-local KEYBIND = string.lower("y") -- must be lowercase, uppercase will be used for mode cycle, ctrl+lowercase will be used for menu
--- comparison is done in lowercase, so all paterns must be lowercase
-local PATTERNS_EXACT = {
-    -- "intro" -- unfortunately ambiguous, some use it as a prologue, some as opening
-    "op", "opening", " - op",
-    "ed", "ending", " - ed",
-    "ending credits", "credits",
-    "pv", "preview", "next episode preview", "next ep. preview", "nextp ep. preview", "next", "next time",
-    "endcard", " - ed card",
-    "ed+cast", "cast",
+-- ====================================================================
+-- OP / ED / PV Skip Script for MPV
+-- Soporta modo interactivo con botón visual (estilo streaming) y auto-skip
+-- ====================================================================
+
+local opt = require("mp.options")
+local assdraw = require("mp.assdraw")
+
+-- --------------------------------------------------------------------
+-- Configuración
+-- --------------------------------------------------------------------
+
+-- Comportamiento por defecto:
+-- "button" = Muestra un botón en pantalla para saltar si el usuario lo desea (Opción B)
+-- "auto"   = Salto automático inmediato (comportamiento original)
+-- "off"    = Desactivado
+local BEHAVIOR = "button"
+
+-- Duración en segundos que el botón permanece en pantalla (0 = todo el capítulo)
+local BUTTON_TIMEOUT = 10
+
+-- Teclas de acceso directo para saltar mientras el botón está visible
+local BUTTON_KEY = "Tab"        -- Tecla principal (ej. "Tab", "s", "Enter")
+local BUTTON_KEY_ALT = "s"      -- Tecla alternativa
+local SHOW_KEY_IN_BUTTON = false -- Mostrar [TAB] en la etiqueta del botón
+
+-- Condición estricta: Requiere que se cumplan AMBAS condiciones obligatoriamente:
+-- 1. Que el nombre del capítulo coincida con Opening / Ending / Preview
+-- 2. Que la duración del capítulo esté entre 88 y 92 segundos (OP/ED)
+local REQUIRE_NAME_AND_DURATION = true
+
+-- Atajo para abrir el menú de ajustes OSD (se usa ctrl+y para no pisar subtítulos en 'y'/'Y')
+local MENU_KEYBIND = "ctrl+y"
+
+-- Patrones de detección de capítulos (en minúsculas)
+local PATTERNS_OP = {
+    "op", "opening", " - op", " (opening)", " - opening",
+    "intro", "apertura", "opening theme", "オープニング",
+    "op song", "op by"
 }
-local PATTERNS_START = {
-    "op by ",
-    "ed song - ",
+
+local PATTERNS_ED = {
+    "ed", "ending", " - ed", " (ending)", "- ending",
+    "ending credits", "credits", "cierre", "outro", "créditos", "creditos",
+    "ending theme", "エンディング", "edcard", " - ed card",
+    "ed+cast", "cast", "ed song"
 }
-local PATTERNS_END = {
-    " (opening)", " - opening", " - op",
-    " (ending)", "- ending", " - ed",
-    " preview",
+
+local PATTERNS_PV = {
+    "pv", "preview", "next episode preview", "next ep. preview", "nextp ep. preview",
+    "next", "next time", "avance", "adelanto", "próximo episodio", "proximo episodio"
 }
--- internal configuration
+
+-- Modos de detección
 local MODE_CHAPTER_NAME   = "chapter name"
 local MODE_CHAPTER_LENGTH = "chapter length"
--- state
+
+-- Estado interno
+local CURRENT_MODE = MODE_CHAPTER_NAME
 local PREV_CHAPTER = nil
 local MENU = false
-local ENABLED = true
-local CURRENT_MODE = MODE_CHAPTER_NAME
-local SELECTED_MENU_ROW = 2 -- 1-4
-local SELECTED_MENU_COL = 1 -- 1-3, used by thresholds
+local SELECTED_MENU_ROW = 1 -- 1: Behavior, 2: Mode, 3: OP/ED threshold, 4: PV threshold
+local SELECTED_MENU_COL = 1
+
 local OP_ED_THRESHOLD = {
-    from = { selected = false, value = 88 },
-    to = { selected = false, value = 92 },
+    from = { selected = false, value = 70 },
+    to   = { selected = false, value = 120 },
 }
 local PV_THRESHOLD = {
     from = { selected = false, value = 14 },
-    to = { selected = false, value = 26 },
+    to   = { selected = false, value = 26 },
 }
 
--- region: menu
-local function increment_from(t)
-    if t.from.value == t.to.value - 1 then
+-- Estado del botón en pantalla
+local overlay = mp.create_osd_overlay("ass-events")
+local button_visible = false
+local is_hovered = false
+local current_chapter_index = nil
+local current_label = "Saltar Intro"
+local button_timer = nil
+local screen_w, screen_h = 1280, 720
+
+-- Animación de desvanecimiento (fade out)
+local FADE_OUT_DURATION = 0.6   -- segundos que tarda en desaparecer
+local fade_opacity = 1.0        -- multiplicador de opacidad (1 = visible, 0 = invisible)
+local fade_timer = nil
+local fading_out = false
+
+-- Convierte una opacidad (0..1) a un valor alfa ASS (&H00& opaco, &HFF& transparente)
+local function opacity_to_ass_alpha(opacity)
+    local a = math.floor(255 - 255 * math.max(0, math.min(1, opacity)) + 0.5)
+    return string.format("&H%02X&", a)
+end
+
+-- ====================================================================
+-- Lógica del Botón en Pantalla (OSD ASS)
+-- ====================================================================
+
+local function get_button_layout()
+    local scale = 1.0
+    if screen_h < 500 then
+        scale = 0.8
+    elseif screen_h >= 1440 and screen_h < 2160 then
+        scale = 1.25
+    elseif screen_h >= 2160 then
+        scale = 1.6
+    end
+
+    local bh = math.floor(44 * scale)
+    local font_size = math.floor(16 * scale)
+    local margin_x = math.floor(40 * scale)
+    local margin_y = math.floor(80 * scale) -- Margen inferior (por encima de la barra uosc)
+
+    local display_text = current_label
+    if SHOW_KEY_IN_BUTTON and BUTTON_KEY and BUTTON_KEY ~= "" then
+        display_text = display_text .. " [" .. BUTTON_KEY:upper() .. "]"
+    end
+
+    -- Cálculo de ancho proporcional para que el texto nunca desborde la caja
+    local char_w = 10.5 * scale
+    local padding_x = 48 * scale
+    local bw = math.max(math.floor(180 * scale), math.floor(#display_text * char_w + padding_x))
+
+    local bx = screen_w - bw - margin_x
+    local by = screen_h - bh - margin_y
+
+    return bx, by, bw, bh, font_size, display_text
+end
+
+local function render_button()
+    if not button_visible or not overlay then return end
+
+    local bx, by, bw, bh, font_size, display_text = get_button_layout()
+
+    overlay.res_x = screen_w
+    overlay.res_y = screen_h
+
+    -- 80% de opacidad:
+    -- En formato ASS: 80% opaco = 20% transparente -> 255 * 0.20 = 51 = 0x33
+    -- En reposo: blanco (&HFFFFFF&) al 80% de opacidad
+    -- En hover: blanco ligeramente más oscuro / gris claro (&HD8D8D8&) al 80% de opacidad
+    local bg_color     = is_hovered and "&HD8D8D8&" or "&HFFFFFF&"
+    local bg_alpha     = opacity_to_ass_alpha(0.8 * fade_opacity)
+    local border_color = is_hovered and "&HB8B8B8&" or "&HE0E0E0&"
+    local border_alpha = opacity_to_ass_alpha(0.8 * fade_opacity)
+    local text_alpha   = opacity_to_ass_alpha(fade_opacity)
+
+    local ass = assdraw.ass_new()
+
+    -- Evento 1: Fondo del botón (rectángulo redondeado)
+    ass:new_event()
+    ass:an(7)
+    ass:pos(0, 0)
+    ass:append(string.format("{\\p1\\c%s\\1a%s\\bord1\\3c%s\\3a%s}", bg_color, bg_alpha, border_color, border_alpha))
+
+    local r = 6
+    local c = 0.5522847498 * r
+    local x0, x1, x2, x3 = bx, bx + r, bx + bw - r, bx + bw
+    local y0, y1, y2, y3 = by, by + r, by + bh - r, by + bh
+    ass:append(string.format(
+        "m %d %d " ..
+        "l %d %d " ..
+        "b %d %d %d %d %d %d " ..
+        "l %d %d " ..
+        "b %d %d %d %d %d %d " ..
+        "l %d %d " ..
+        "b %d %d %d %d %d %d " ..
+        "l %d %d " ..
+        "b %d %d %d %d %d %d",
+        x1, y0,
+        x2, y0,
+        x2 + c, y0, x3, y1 - c, x3, y1,
+        x3, y2,
+        x3, y2 + c, x2 + c, y3, x2, y3,
+        x1, y3,
+        x1 - c, y3, x0, y2 + c, x0, y2,
+        x0, y1,
+        x0, y1 - c, x1 - c, y0, x1, y0
+    ))
+    ass:append("{\\p0}")
+
+    -- Evento 2: Texto centrado dentro del botón con tipografía Inter en negro
+    ass:new_event()
+    ass:an(5)
+    local cx = math.floor(bx + bw / 2)
+    local cy = math.floor(by + bh / 2)
+    ass:pos(cx, cy)
+    ass:append(string.format(
+        "{\\fnInter\\fs%d\\b1\\c&H000000&\\1a%s\\bord0\\shad0}%s",
+        font_size, text_alpha, display_text
+    ))
+
+    overlay.data = ass.text
+    overlay:update()
+end
+
+-- Segundos antes del final del vídeo a los que se salta cuando el segmento es el último capítulo
+local END_SEEK_OFFSET = 5
+
+local function seek_to_end_of_file()
+    local file_duration = mp.get_property_number("duration")
+    if not file_duration or file_duration <= 0 then return end
+    local target = math.max(0, file_duration - END_SEEK_OFFSET)
+    local position = mp.get_property_number("time-pos") or 0
+    if position < target then
+        mp.commandv("seek", tostring(target), "absolute", "exact")
+    end
+end
+
+local function execute_seek(chapter_index)
+    local chapters = mp.get_property_number("chapter-list/count")
+    if not chapters then return end
+
+    local to_chapter = chapter_index + 1
+
+    if chapter_index >= chapters - 1 or to_chapter >= chapters then
+        -- No quedan más capítulos: saltar a los últimos 5 segundos del vídeo
+        seek_to_end_of_file()
+    else
+        local chapter_start = mp.get_property_number("chapter-list/" .. to_chapter .. "/time")
+        local file_duration = mp.get_property_number("duration")
+
+        if chapter_start and file_duration and chapter_start >= file_duration then
+            -- El siguiente capítulo empieza más allá del final del archivo
+            seek_to_end_of_file()
+        else
+            mp.set_property_number("chapter", to_chapter)
+        end
+    end
+end
+
+local function stop_fade()
+    if fade_timer then
+        fade_timer:kill()
+        fade_timer = nil
+    end
+    fading_out = false
+    fade_opacity = 1.0
+end
+
+-- Oculta el botón de forma inmediata (usado al pulsar, al cambiar de archivo, etc.)
+local function hide_skip_button()
+    if not button_visible then return end
+    button_visible = false
+    is_hovered = false
+    current_chapter_index = nil
+
+    if button_timer then
+        button_timer:kill()
+        button_timer = nil
+    end
+    stop_fade()
+
+    mp.remove_key_binding("op-ed-skip-click")
+    if BUTTON_KEY and BUTTON_KEY ~= "" then
+        mp.remove_key_binding("op-ed-skip-key")
+    end
+    if BUTTON_KEY_ALT and BUTTON_KEY_ALT ~= "" then
+        mp.remove_key_binding("op-ed-skip-key-alt")
+    end
+
+    if overlay then
+        overlay:remove()
+    end
+end
+
+-- Oculta el botón con un desvanecimiento suave (fade out)
+local function fade_out_skip_button()
+    if not button_visible or fading_out then return end
+
+    if not FADE_OUT_DURATION or FADE_OUT_DURATION <= 0 then
+        hide_skip_button()
         return
     end
 
+    if button_timer then
+        button_timer:kill()
+        button_timer = nil
+    end
+
+    fading_out = true
+    local start_time = mp.get_time()
+
+    fade_timer = mp.add_periodic_timer(1 / 60, function()
+        local t = (mp.get_time() - start_time) / FADE_OUT_DURATION
+        if t >= 1 then
+            hide_skip_button()
+            return
+        end
+        -- Curva ease-in-out (smoothstep) para un desvanecimiento natural
+        local eased = t * t * (3 - 2 * t)
+        fade_opacity = 1 - eased
+        render_button()
+    end)
+end
+
+local function trigger_skip()
+    if not button_visible or current_chapter_index == nil then return end
+    -- Durante el fade out solo se permite saltar si seguimos en el mismo capítulo
+    if fading_out and mp.get_property_number("chapter") ~= current_chapter_index then return end
+    local ch = current_chapter_index
+    hide_skip_button()
+    execute_seek(ch)
+end
+
+local function on_mouse_move(_, mouse)
+    if not button_visible or not mouse or not mouse.hover then
+        if is_hovered then
+            is_hovered = false
+            mp.remove_key_binding("op-ed-skip-click")
+            render_button()
+        end
+        return
+    end
+
+    local bx, by, bw, bh = get_button_layout()
+    local inside = (mouse.x >= bx and mouse.x <= bx + bw and mouse.y >= by and mouse.y <= by + bh)
+
+    if inside ~= is_hovered then
+        is_hovered = inside
+        if is_hovered then
+            mp.add_forced_key_binding("MBTN_LEFT", "op-ed-skip-click", function()
+                trigger_skip()
+            end)
+        else
+            mp.remove_key_binding("op-ed-skip-click")
+        end
+        render_button()
+    end
+end
+
+local function show_skip_button(chapter_idx, label)
+    if button_visible then
+        hide_skip_button()
+    end
+
+    current_chapter_index = chapter_idx
+    current_label = label or "Saltar Intro"
+    button_visible = true
+    is_hovered = false
+    stop_fade()
+
+    local ow, oh = mp.get_osd_size()
+    if ow and oh and ow > 0 and oh > 0 then
+        screen_w = ow
+        screen_h = oh
+    end
+
+    render_button()
+
+    -- Asignar atajos de teclado mientras el botón está visible
+    if BUTTON_KEY and BUTTON_KEY ~= "" then
+        mp.add_forced_key_binding(BUTTON_KEY, "op-ed-skip-key", trigger_skip)
+    end
+    if BUTTON_KEY_ALT and BUTTON_KEY_ALT ~= "" and BUTTON_KEY_ALT ~= BUTTON_KEY then
+        mp.add_forced_key_binding(BUTTON_KEY_ALT, "op-ed-skip-key-alt", trigger_skip)
+    end
+
+    -- Temporizador para ocultar el botón si el usuario decide no saltar
+    if BUTTON_TIMEOUT and BUTTON_TIMEOUT > 0 then
+        button_timer = mp.add_timeout(BUTTON_TIMEOUT, function()
+            fade_out_skip_button()
+        end)
+    end
+end
+
+-- Observar cambios de resolución / dimensiones de ventana
+mp.observe_property("osd-dimensions", "native", function(_, dims)
+    if dims and dims.w and dims.h and dims.w > 0 and dims.h > 0 then
+        screen_w = dims.w
+        screen_h = dims.h
+        if button_visible then
+            render_button()
+        end
+    end
+end)
+
+-- Observar movimiento del ratón
+mp.observe_property("mouse-pos", "native", on_mouse_move)
+
+-- ====================================================================
+-- Detección de Capítulos (OP / ED / PV)
+-- ====================================================================
+
+local function starts_with(str, start)
+    return str:sub(1, #start) == start
+end
+
+local function ends_with(str, ending)
+    return ending == "" or str:sub(-#ending) == ending
+end
+
+local function match_chapter(chapter_index)
+    local raw_title = mp.get_property("chapter-list/" .. chapter_index .. "/title")
+    if not raw_title then return false, nil, nil end
+    local title = raw_title:lower():match("^%s*(.-)%s*$") -- limpiar espacios
+
+    local function check_list(list)
+        for _, pattern in ipairs(list) do
+            if title == pattern then return true end
+            if starts_with(title, pattern) then return true end
+            if ends_with(title, pattern) then return true end
+        end
+        return false
+    end
+
+    if check_list(PATTERNS_OP) then
+        return true, "OP", "Saltar Opening"
+    elseif check_list(PATTERNS_ED) then
+        return true, "ED", "Saltar Ending"
+    elseif check_list(PATTERNS_PV) then
+        return true, "PV", "Saltar Avance"
+    end
+
+    return false, nil, nil
+end
+
+local function get_chapter_length(chapter_index)
+    local current_chapter_start = mp.get_property_number("chapter-list/" .. chapter_index .. "/time")
+    if not current_chapter_start then return 0 end
+
+    local chapter_count = mp.get_property_number("chapter-list/count")
+    local last_chapter_index = (chapter_count or 1) - 1
+
+    if chapter_index >= last_chapter_index then
+        local file_duration = mp.get_property_number("duration") or 0
+        return math.max(0, file_duration - current_chapter_start)
+    else
+        local next_chapter_start = mp.get_property_number("chapter-list/" .. chapter_index + 1 .. "/time") or 0
+        return math.max(0, next_chapter_start - current_chapter_start)
+    end
+end
+
+local function handle_chapter_entered(chapter_index)
+    if BEHAVIOR == "off"
+    or chapter_index == nil
+    or chapter_index < 0
+    then
+        return
+    end
+
+    local is_match = false
+    local seg_type = nil
+    local seg_label = nil
+
+    local name_match, matched_type, matched_label = match_chapter(chapter_index)
+    local chapter_length = get_chapter_length(chapter_index)
+
+    if REQUIRE_NAME_AND_DURATION then
+        -- CONDICIÓN OBLIGATORIA: Deben cumplirse AMBAS:
+        -- 1. Que coincida el nombre del capítulo (Opening / Ending / Preview)
+        -- 2. Que la duración esté en el rango de 88 a 92 segundos (o 14-26s para Preview)
+        if name_match then
+            if (matched_type == "OP" or matched_type == "ED")
+               and chapter_length >= OP_ED_THRESHOLD.from.value
+               and chapter_length <= OP_ED_THRESHOLD.to.value
+            then
+                is_match = true
+                seg_type = matched_type
+                seg_label = matched_label
+            elseif matched_type == "PV"
+               and chapter_length >= PV_THRESHOLD.from.value
+               and chapter_length <= PV_THRESHOLD.to.value
+            then
+                is_match = true
+                seg_type = matched_type
+                seg_label = matched_label
+            end
+        end
+    else
+        -- Modo permisivo (solo nombre o solo duración)
+        if CURRENT_MODE == MODE_CHAPTER_NAME then
+            is_match, seg_type, seg_label = name_match, matched_type, matched_label
+        elseif CURRENT_MODE == MODE_CHAPTER_LENGTH then
+            local chapter_count = mp.get_property_number("chapter-list/count")
+            local last_chapter_index = (chapter_count or 1) - 1
+
+            if (chapter_index <= 2 or chapter_index >= last_chapter_index - 2)
+               and chapter_length >= OP_ED_THRESHOLD.from.value
+               and chapter_length <= OP_ED_THRESHOLD.to.value
+            then
+                if chapter_index <= 2 then
+                    is_match = true
+                    seg_type = "OP"
+                    seg_label = "Saltar Opening"
+                else
+                    is_match = true
+                    seg_type = "ED"
+                    seg_label = "Saltar Ending"
+                end
+            elseif chapter_index == last_chapter_index
+               and chapter_length >= PV_THRESHOLD.from.value
+               and chapter_length <= PV_THRESHOLD.to.value
+            then
+                is_match = true
+                seg_type = "PV"
+                seg_label = "Saltar Avance"
+            end
+        end
+    end
+
+    if is_match then
+        if BEHAVIOR == "auto" then
+            execute_seek(chapter_index)
+        else -- BEHAVIOR == "button"
+            show_skip_button(chapter_index, seg_label)
+        end
+    end
+
+    PREV_CHAPTER = chapter_index
+end
+
+mp.observe_property("chapter", "number", function(_, chapter_index)
+    -- Si el capítulo termina con el botón aún visible, desvanecerlo suavemente
+    fade_out_skip_button()
+    handle_chapter_entered(chapter_index)
+end)
+
+mp.observe_property("path", "none", function()
+    hide_skip_button()
+    PREV_CHAPTER = nil
+end)
+
+-- Detectar si los capítulos tienen nombres propios o solo números (Chapter 01...)
+mp.observe_property("chapters", "number", function(_, chapter_count)
+    if chapter_count == nil or chapter_count == 0 then return end
+
+    local named_chapters = false
+    for chapter_index = 0, chapter_count - 1 do
+        local title = mp.get_property("chapter-list/" .. chapter_index .. "/title")
+        if title and not starts_with(title, "Chapter ") and not starts_with(title, "chapter ") then
+            named_chapters = true
+            break
+        end
+    end
+
+    if named_chapters and CURRENT_MODE ~= MODE_CHAPTER_NAME then
+        CURRENT_MODE = MODE_CHAPTER_NAME
+    elseif not named_chapters and CURRENT_MODE ~= MODE_CHAPTER_LENGTH then
+        CURRENT_MODE = MODE_CHAPTER_LENGTH
+    end
+end)
+
+-- ====================================================================
+-- Menú OSD de Ajustes (Ctrl + Y)
+-- ====================================================================
+
+local function increment_from(t)
+    if t.from.value == t.to.value - 1 then return end
     t.from.value = t.from.value + 1
 end
 
 local function decrement_from(t)
-    if t.from.value == 0 then
-        return
-    end
-
+    if t.from.value == 0 then return end
     t.from.value = t.from.value - 1
 end
 
@@ -60,11 +560,7 @@ local function increment_to(t)
 end
 
 local function decrement_to(t)
-    if t.to.value == 0
-    or t.from.value == t.to.value - 1 then
-        return
-    end
-
+    if t.to.value == 0 or t.from.value == t.to.value - 1 then return end
     t.to.value = t.to.value - 1
 end
 
@@ -79,66 +575,66 @@ function PV_THRESHOLD.to:decrement() decrement_to(PV_THRESHOLD) end
 
 local function draw_menu()
     local menu = {
-        { name = "Skip OP/ED/PV", items = {} }
+        { name = "Ajustes Skip OP/ED/PV", items = {} }
     }
 
-    if ENABLED then
-        table.insert(menu[1].items, "- Enabled: {\\b1}yes{\\b0} | {\\b0}no{\\b0}")
+    -- Item 1: Comportamiento
+    local behavior_str = "- Modo: "
+    if BEHAVIOR == "button" then
+        behavior_str = behavior_str .. "{\\b1}[Botón visual]{\\b0} | Auto | Desactivado"
+    elseif BEHAVIOR == "auto" then
+        behavior_str = behavior_str .. "Botón | {\\b1}[Auto-skip]{\\b0} | Desactivado"
     else
-        table.insert(menu[1].items, "- Enabled: {\\b0}yes{\\b0} | {\\b1}no{\\b0}")
+        behavior_str = behavior_str .. "Botón | Auto | {\\b1}[Desactivado]{\\b0}"
     end
+    table.insert(menu[1].items, behavior_str)
 
-    if CURRENT_MODE == MODE_CHAPTER_NAME then
-        table.insert(menu[1].items, "- Mode: {\\b1}name{\\b0} | {\\b0}length{\\b0}")
-    elseif CURRENT_MODE == MODE_CHAPTER_LENGTH then
-        table.insert(menu[1].items, "- Mode: {\\b0}name{\\b0} | {\\b1}length{\\b0}")
-
-        local function bool_to_integer(boolean)
-            if boolean then
-                return 1
-            else
-                return 0
-            end
-        end
-
-        table.insert(menu, { name = "Length thresholds", items = {
+    local function bool_to_int(b) return b and 1 or 0 end
+    if REQUIRE_NAME_AND_DURATION then
+        table.insert(menu[1].items, "- Requisito: {\\b1}Nombre + Duración (ambas){\\b0}")
+        table.insert(menu, { name = "Umbrales de duración", items = {
             string.format(
-                "- OP/ED: {\\b%i}%i{\\b0}-{\\b%i}%i{\\b0} seconds",
-                bool_to_integer(OP_ED_THRESHOLD.from.selected), OP_ED_THRESHOLD.from.value,
-                bool_to_integer(OP_ED_THRESHOLD.to.selected), OP_ED_THRESHOLD.to.value
+                "- OP/ED: {\\b%i}%i{\\b0}-{\\b%i}%i{\\b0} seg",
+                bool_to_int(OP_ED_THRESHOLD.from.selected), OP_ED_THRESHOLD.from.value,
+                bool_to_int(OP_ED_THRESHOLD.to.selected), OP_ED_THRESHOLD.to.value
             ),
             string.format(
-                "- PV: {\\b%i}%i{\\b0}-{\\b%i}%i{\\b0} seconds",
-                bool_to_integer(PV_THRESHOLD.from.selected), PV_THRESHOLD.from.value,
-                bool_to_integer(PV_THRESHOLD.to.selected), PV_THRESHOLD.to.value
+                "- PV: {\\b%i}%i{\\b0}-{\\b%i}%i{\\b0} seg",
+                bool_to_int(PV_THRESHOLD.from.selected), PV_THRESHOLD.from.value,
+                bool_to_int(PV_THRESHOLD.to.selected), PV_THRESHOLD.to.value
+            )
+        }})
+    elseif CURRENT_MODE == MODE_CHAPTER_NAME then
+        table.insert(menu[1].items, "- Detección: {\\b1}Nombre capítulo{\\b0} | Duración")
+    else
+        table.insert(menu[1].items, "- Detección: Nombre capítulo | {\\b1}Duración{\\b0}")
+
+        table.insert(menu, { name = "Umbrales de duración", items = {
+            string.format(
+                "- OP/ED: {\\b%i}%i{\\b0}-{\\b%i}%i{\\b0} seg",
+                bool_to_int(OP_ED_THRESHOLD.from.selected), OP_ED_THRESHOLD.from.value,
+                bool_to_int(OP_ED_THRESHOLD.to.selected), OP_ED_THRESHOLD.to.value
+            ),
+            string.format(
+                "- PV: {\\b%i}%i{\\b0}-{\\b%i}%i{\\b0} seg",
+                bool_to_int(PV_THRESHOLD.from.selected), PV_THRESHOLD.from.value,
+                bool_to_int(PV_THRESHOLD.to.selected), PV_THRESHOLD.to.value
             )
         }})
     end
 
-    local function array_length(t)
-        local length = 0;
-
-        for _ in ipairs(t) do
-            length = length + 1
-        end
-
-        return length
-    end
-
     local ass = ""
-    local row_offset = 0;
+    local row_offset = 0
     for _, section in ipairs(menu) do
-        ass = ass .. section.name .. "\\N"
-
+        ass = ass .. "{\\b1}" .. section.name .. "{\\b0}\\N"
         for i, item in ipairs(section.items) do
             if row_offset + i == SELECTED_MENU_ROW then
-                ass = ass .. "{\\c&H46CFFF&}" .. item .. "{\\c&HFFFFFF&}" .. "\\N"
+                ass = ass .. "{\\c&H46CFFF&}" .. item .. "{\\c&HFFFFFF&}\\N"
             else
                 ass = ass .. item .. "\\N"
             end
         end
-
-        row_offset = row_offset + array_length(section.items)
+        row_offset = row_offset + #section.items
     end
 
     mp.set_osd_ass(0, 0, ass)
@@ -154,357 +650,72 @@ local function hide_menu()
     mp.remove_key_binding("op-ed-pv-skip-menu-esc")
 end
 
-mp.add_key_binding("ctrl+" .. KEYBIND, 'op-ed-pv-skip-settings', function ()
+mp.add_key_binding(MENU_KEYBIND, 'op-ed-pv-skip-settings', function()
     if not MENU then
         MENU = true
         draw_menu()
 
-        mp.add_forced_key_binding("UP", "op-ed-pv-skip-menu-up", function ()
-            if SELECTED_MENU_ROW <= 1 then
-                return
-            -- op/ed threshold
-            elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 2 then
-                OP_ED_THRESHOLD.from.increment()
-            elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 3 then
-                OP_ED_THRESHOLD.to.increment()
-            -- pv threshold
-            elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 2 then
-                PV_THRESHOLD.from.increment()
-            elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 3 then
-                PV_THRESHOLD.to.increment()
-            else
-                SELECTED_MENU_ROW = SELECTED_MENU_ROW - 1
-            end
-
+        mp.add_forced_key_binding("UP", "op-ed-pv-skip-menu-up", function()
+            if SELECTED_MENU_ROW <= 1 then return
+            elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 2 then OP_ED_THRESHOLD.from.increment()
+            elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 3 then OP_ED_THRESHOLD.to.increment()
+            elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 2 then PV_THRESHOLD.from.increment()
+            elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 3 then PV_THRESHOLD.to.increment()
+            else SELECTED_MENU_ROW = SELECTED_MENU_ROW - 1 end
             draw_menu()
         end, {repeatable=true})
 
-        mp.add_forced_key_binding("DOWN", "op-ed-pv-skip-menu-down", function ()
-            if CURRENT_MODE == MODE_CHAPTER_NAME and SELECTED_MENU_ROW >= 2 then
-                return
-            -- op/ed threshold
-            elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 2 then
-                OP_ED_THRESHOLD.from.decrement()
-            elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 3 then
-                OP_ED_THRESHOLD.to.decrement()
-            -- pv threshold
-            elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 2 then
-                PV_THRESHOLD.from.decrement()
-            elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 3 then
-                PV_THRESHOLD.to.decrement()
-            elseif SELECTED_MENU_ROW >= 4 then
-                return
-            else
-                SELECTED_MENU_ROW = SELECTED_MENU_ROW + 1
-            end
-
+        mp.add_forced_key_binding("DOWN", "op-ed-pv-skip-menu-down", function()
+            if not REQUIRE_NAME_AND_DURATION and CURRENT_MODE == MODE_CHAPTER_NAME and SELECTED_MENU_ROW >= 2 then return
+            elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 2 then OP_ED_THRESHOLD.from.decrement()
+            elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 3 then OP_ED_THRESHOLD.to.decrement()
+            elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 2 then PV_THRESHOLD.from.decrement()
+            elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 3 then PV_THRESHOLD.to.decrement()
+            elseif SELECTED_MENU_ROW >= 4 then return
+            else SELECTED_MENU_ROW = SELECTED_MENU_ROW + 1 end
             draw_menu()
         end, {repeatable=true})
 
-        mp.add_forced_key_binding("LEFT", "op-ed-pv-skip-menu-left", function ()
-            -- enabled
+        mp.add_forced_key_binding("LEFT", "op-ed-pv-skip-menu-left", function()
             if SELECTED_MENU_ROW == 1 then
-                ENABLED = true
-            -- mode
+                if BEHAVIOR == "off" then BEHAVIOR = "auto"
+                elseif BEHAVIOR == "auto" then BEHAVIOR = "button" end
             elseif SELECTED_MENU_ROW == 2 then
                 CURRENT_MODE = MODE_CHAPTER_NAME
-            -- op/ed threshold
             elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 2 then
-                OP_ED_THRESHOLD.from.selected = false
-                SELECTED_MENU_COL = 1
+                OP_ED_THRESHOLD.from.selected = false; SELECTED_MENU_COL = 1
             elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 3 then
-                OP_ED_THRESHOLD.from.selected = true
-                OP_ED_THRESHOLD.to.selected = false
-                SELECTED_MENU_COL = 2;
-            -- pv threshold
+                OP_ED_THRESHOLD.from.selected = true; OP_ED_THRESHOLD.to.selected = false; SELECTED_MENU_COL = 2
             elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 2 then
-                PV_THRESHOLD.from.selected = false
-                SELECTED_MENU_COL = 1
+                PV_THRESHOLD.from.selected = false; SELECTED_MENU_COL = 1
             elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 3 then
-                PV_THRESHOLD.from.selected = true
-                PV_THRESHOLD.to.selected = false
-                SELECTED_MENU_COL = 2;
-            else
-                return
+                PV_THRESHOLD.from.selected = true; PV_THRESHOLD.to.selected = false; SELECTED_MENU_COL = 2
             end
-
             draw_menu()
         end)
 
-        mp.add_forced_key_binding("RIGHT", "op-ed-pv-skip-menu-right", function ()
-            -- enabled
+        mp.add_forced_key_binding("RIGHT", "op-ed-pv-skip-menu-right", function()
             if SELECTED_MENU_ROW == 1 then
-                ENABLED = false
-            -- mode
+                if BEHAVIOR == "button" then BEHAVIOR = "auto"
+                elseif BEHAVIOR == "auto" then BEHAVIOR = "off" end
             elseif SELECTED_MENU_ROW == 2 then
                 CURRENT_MODE = MODE_CHAPTER_LENGTH
-            -- op/ed threshold
             elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 1 then
-                OP_ED_THRESHOLD.from.selected = true
-                SELECTED_MENU_COL = 2
+                OP_ED_THRESHOLD.from.selected = true; SELECTED_MENU_COL = 2
             elseif SELECTED_MENU_ROW == 3 and SELECTED_MENU_COL == 2 then
-                OP_ED_THRESHOLD.from.selected = false
-                OP_ED_THRESHOLD.to.selected = true
-                SELECTED_MENU_COL = 3;
-            -- pv threshold
+                OP_ED_THRESHOLD.from.selected = false; OP_ED_THRESHOLD.to.selected = true; SELECTED_MENU_COL = 3
             elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 1 then
-                PV_THRESHOLD.from.selected = true
-                SELECTED_MENU_COL = 2
+                PV_THRESHOLD.from.selected = true; SELECTED_MENU_COL = 2
             elseif SELECTED_MENU_ROW == 4 and SELECTED_MENU_COL == 2 then
-                PV_THRESHOLD.from.selected = false
-                PV_THRESHOLD.to.selected = true
-                SELECTED_MENU_COL = 3;
-            else
-                return
+                PV_THRESHOLD.from.selected = false; PV_THRESHOLD.to.selected = true; SELECTED_MENU_COL = 3
             end
-
             draw_menu()
         end)
 
-        mp.add_forced_key_binding("ESC", "op-ed-pv-skip-menu-esc", function ()
+        mp.add_forced_key_binding("ESC", "op-ed-pv-skip-menu-esc", function()
             hide_menu()
         end)
     else
         hide_menu()
     end
-end)
--- endregion: menu
-
-local function starts_with(str, start)
-    return str:sub(1, #start) == start
-end
-
-local function is_op_ed_pv(chapter_index)
-    local title = mp.get_property("chapter-list/" .. chapter_index .. "/title"):lower()
-
-    for _, pattern in ipairs(PATTERNS_EXACT) do
-        if pattern == title then
-            return true
-        end
-    end
-
-    for _, pattern in ipairs(PATTERNS_START) do
-        if starts_with(title, pattern) then
-            return true
-        end
-    end
-
-    local function ends_with(str, ending)
-        return ending == "" or str:sub(-#ending) == ending
-    end
-
-    for _, pattern in ipairs(PATTERNS_END) do
-        if ends_with(title, pattern) then
-            return true
-        end
-    end
-
-    return false
-end
-
-local function seek_to_next_or_prev_chapter(chapter_index)
-    -- figure out in which direction the chapter was changed
-    local forward, to_chapter
-    if PREV_CHAPTER == nil or chapter_index > PREV_CHAPTER then
-        forward = true
-        to_chapter = chapter_index + 1
-    else
-        forward = false
-        to_chapter = chapter_index - 1
-
-        -- check previous title, if it's an opening, skip over it
-        -- but don't if we're already on first chapter,
-        -- previous chapter will go out of bounds, and result in a crash trying to get a chapter title
-        if to_chapter > 0 and is_op_ed_pv(to_chapter) then
-            to_chapter = to_chapter - 1
-        end
-    end
-
-    local chapters = mp.get_property_number("chapter-list/count")
-    local is_seeking = mp.get_property_bool("seeking")
-
-    if not forward and is_seeking then
-        -- avoid getting stuck when seeking backwards into chapter thats then immediately skipped
-        -- instead, step over the skipped chapter, and seek into previous chapter
-
-        local chapter_end
-        if chapter_index >= chapters - 1 then
-            -- current chapter is last, use total file duration instead
-            -- e.g. ../Part B/ED/Part C|, when seeking from part C over ED
-            chapter_end = mp.get_property_number("duration")
-        else
-            -- start of the next chapter is also the end of current chapter
-            chapter_end = mp.get_property_number("chapter-list/" .. chapter_index + 1 .. "/time")
-        end
-
-        local chapter_start = mp.get_property_number("chapter-list/" .. chapter_index .. "/time")
-        local current_position = mp.get_property_number("playback-time")
-
-        -- how many seconds we've seeked into the skipped chapter
-        local seeked_skipped = chapter_end - current_position
-
-        -- check if we skipped exactly an entire chapter
-        -- floor the floats before comparing
-        local chapter_length = chapter_end - chapter_start
-        if math.floor(chapter_length) == math.floor(seeked_skipped) then
-            -- entire chapter was skipped, seek to the start of the previous one
-            mp.set_property_number("chapter", to_chapter)
-        elseif chapter_index == 0 then
-            -- if first chapter is an opening, seek into it instead
-            -- don't have to do anything for that, this is the default behaviour
-        else
-            -- seek into the previous chapter
-            local seeked_previous = chapter_start - seeked_skipped
-            mp.set_property_number("playback-time", seeked_previous)
-        end
-    elseif chapter_index >= chapters - 1 then
-        -- on last chapter, to next playlist item
-        -- if we don't do this, we'll still go to the next item, but will get the following error
-        -- The chapter option must be <= {last chapter}: {last chapter + 1}
-        mp.command("playlist-next")
-    else
-        local next_chapter_start = mp.get_property_number("chapter-list/" .. to_chapter + 1 .. "/time")
-        local chapter_start = mp.get_property_number("chapter-list/" .. to_chapter .. "/time")
-        local file_duration = mp.get_property_number("duration")
-
-        if next_chapter_start == nil and chapter_start > file_duration then
-            -- if last chapter starts beyond the end of the file, playback will get stuck when switched to the next file
-            mp.command("playlist-next")
-        else
-            -- to next or previous chapter
-            mp.set_property_number("chapter", to_chapter)
-        end
-    end
-end
-
-local function mode_cycle()
-    if CURRENT_MODE == MODE_CHAPTER_NAME then
-        CURRENT_MODE = MODE_CHAPTER_LENGTH
-    elseif CURRENT_MODE == MODE_CHAPTER_LENGTH then
-        CURRENT_MODE = MODE_CHAPTER_NAME
-    end
-end
-
-mp.add_key_binding(KEYBIND, "op-ed-pv-skip-toggle", function()
-    local msg = "OP/ED/PV skip: "
-    if ENABLED then
-        ENABLED = false
-        msg = msg .. "disabled"
-    else
-        ENABLED = true
-        msg = msg .. "enabled"
-    end
-
-    if MENU then
-        -- redraw to update `Enabled` value
-        draw_menu()
-    else
-        mp.osd_message(msg)
-    end
-end)
-
-mp.add_key_binding(string.upper(KEYBIND), "op-ed-pv-skip-mode-cycle", function ()
-    if not ENABLED then
-        return
-    end
-
-    mode_cycle()
-
-    if MENU then
-        -- redraw to update `Mode` value
-        draw_menu()
-    else
-        mp.osd_message("OP/ED/PV skip: " .. CURRENT_MODE)
-    end
-end)
-
-mp.observe_property("chapters", "number", function(_, chapter_count)
-    if chapter_count == nil
-    or chapter_count == 0 then
-        return
-    end
-
-    -- must run before `chapter` handler
-    -- otherwise, chapter skip might not happen when opening the file (and first chapter is an OP)
-
-    local named_chapters = false
-    for chapter_index = 0, chapter_count - 1 do -- range is inclusive, but chapters are 0-indexed
-        local title = mp.get_property("chapter-list/" .. chapter_index .. "/title")
-        if not starts_with(title, "Chapter ") then
-            named_chapters = true
-            break
-        end
-    end
-
-    if (named_chapters and CURRENT_MODE ~= MODE_CHAPTER_NAME)
-    or (not named_chapters and CURRENT_MODE ~= MODE_CHAPTER_LENGTH)
-    then
-        -- `mp.commandv("keypress", string.upper(KEYBIND))` could have been used here,
-        -- but the mode cycle seem to happen after `chapter` handler, so skip doesn't happen when opening the file
-        mode_cycle()
-        mp.osd_message("OP/ED/PV skip: " .. CURRENT_MODE)
-    end
-end)
-
-mp.observe_property("chapter", "number", function(_, chapter_index)
-    if not ENABLED
-    or chapter_index == nil -- nil on startup before opening the file
-    or chapter_index < 0    -- -1 when seeking backwards on first chapter
-    then
-        -- 0 is emitted next, so ignore this event
-        return
-    end
-
-    if CURRENT_MODE == MODE_CHAPTER_NAME then
-        if is_op_ed_pv(chapter_index) then
-            seek_to_next_or_prev_chapter(chapter_index)
-        end
-    elseif CURRENT_MODE == MODE_CHAPTER_LENGTH then
-        -- figure out chapter length
-        local current_chapter_start = mp.get_property_number("chapter-list/" .. chapter_index .. "/time")
-        local chapter_count = mp.get_property_number("chapter-list/count")
-        local last_chapter_index = chapter_count - 1
-        local chapter_length
-        if chapter_index == last_chapter_index then
-            -- last chapter, since there's no next chapter, substract from total duration instead
-            local file_duration = mp.get_property_number("duration")
-            chapter_length = file_duration - current_chapter_start
-        else
-            local next_chapter_start = mp.get_property_number("chapter-list/" .. chapter_index + 1 .. "/time")
-            chapter_length = next_chapter_start - current_chapter_start
-        end
-
-        -- chapter_length is a float, so use ranges when comparing
-        if (chapter_index == 0                      -- |OP/..
-        or chapter_index == 1                       -- |Intro/OP/..
-        or chapter_index == 2                       -- |???/Intro/OP/..
-        or chapter_index == last_chapter_index      -- ../ED|
-        or chapter_index == last_chapter_index - 1  -- ../ED/PV|
-        or chapter_index == last_chapter_index - 2) -- ../ED/PV/Endcard|
-        and chapter_length >= OP_ED_THRESHOLD.from.value
-        and chapter_length <= OP_ED_THRESHOLD.to.value
-        then
-            seek_to_next_or_prev_chapter(chapter_index)
-        end
-
-        if chapter_index == last_chapter_index -- ../Preview|
-        and chapter_length >= PV_THRESHOLD.from.value
-        and chapter_length <= PV_THRESHOLD.to.value
-        then
-            seek_to_next_or_prev_chapter(chapter_index)
-        end
-    end
-
-    PREV_CHAPTER = chapter_index
-end)
-
-mp.observe_property("path", "none", function()
-    -- reset previous chapter when changing files,
-    -- `seek_to_next_or_prev_chapter` checks in which direction the chapter was changed
-    -- by comparing current and previous chapter indices, if it was backwards,
-    -- then it checks the previous title by substracting 1 and calling `is_op_ed_pv`,
-    -- the problem is that if we change the file, and the first chapter is an opening,
-    -- then current chapter index is 0, but previous was not reset and probably >0,
-    -- so -1 gets passed into `is_op_ed_pv`, which then crashes when trying to fetch the title
-    PREV_CHAPTER = nil
 end)
